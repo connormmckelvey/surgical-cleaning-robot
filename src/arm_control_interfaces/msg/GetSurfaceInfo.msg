@@ -1,0 +1,7 @@
+# msg/GetSurfaceInfo.msg
+geometry_msgs/Point surface_centroid
+geometry_msgs/Vector3 surface_normal
+geometry_msgs/Point spill_centroid
+geometry_msgs/Vector3 spill_normal
+sensor_msgs/PointCloud2 point_cloud
+bool success

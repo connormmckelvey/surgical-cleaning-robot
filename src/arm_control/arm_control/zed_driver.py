@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+Zed 2i Camera Driver Node for Ros2, made for the Surgical Arm Project.
+Written by Connor McKelvey, 2026
+The goal of this node was to provide a driver that provided camera frame, arm pose data, and ArUco board pose data for calibration 
+in a modular, ros2 format so that we can write different launches and nodes that use various parts of the zed data
+you can enable a graphics window, and enable/disable arm and tag tracking to prevent unnecessary computation when unneeded. 
+The node also provides a service to get the plane geometry of a surface in the camera frame 
+Inputs: none (altho make sure camera is plugged in and connected if using wsl)
+Outputs: camera frame (sensor_msgs/Image), human arm pose (geometry_msgs/PoseArray), ArUco board pose (geometry_msgs/PoseStamped)
+Services: GetPlaneAtPixel, GetPointCloud
+"""
+
+import sys
+import rclpy
+from rclpy.node import Node
+from sensor_msgs.msg import Image
+from geometry_msgs.msg import PoseArray, Pose, PoseStamped, Point, Vector3
+from sensor_msgs.msg import PointCloud2, PointField
+from arm_control_interfaces.srv import GetPlaneAtPixel, GetPointCloud
+import pyzed.sl as sl
+import cv2 as cv
+import numpy as np
+from scipy.spatial.transform import Rotation as ScipyRot
+
+# Importing utility functions from the workspace, can change this to 18 if you do not need hand tracking. both /utils have the same function names
+from arm_control.utilities.ZED_bodytracking_34 import (
+    setup_body_tracking,
+    get_single_body,
+    get_arm_points,
+    draw_arm_points_and_lines,
+)
+
+class ZedDriverNode(Node):
+    def __init__(self):
+        super().__init__('zed_driver')
+
+        # --- Parameters ---
+        self.declare_parameter('arm_to_track', 'left')
+        self.declare_parameter('show_visualization', True)
+        self.declare_parameter('camera_fps', 15)
+        self.declare_parameter('track_tag', True)
+        self.declare_parameter('track_arm', False)
+        self.declare_parameter('publish_raw',True)
+
+        self.arm_to_track = self.get_parameter('arm_to_track').value
+        self.show_visualization = self.get_parameter('show_visualization').value
+        self.camera_fps = self.get_parameter('camera_fps').value
+        self.tracking = {
+            "tag": self.get_parameter('track_tag').value,
+            "arm": self.get_parameter('track_arm').value
+        }
+        self.publish_raw = self.get_parameter("publish_raw").value
+
+        # --- Publishers, these will only be pulished if self.tracking is true for each ---
+        self.image_pub = self.create_publisher(Image, 'camera/image_raw', 10)
+        self.arm_pose_pub = self.create_publisher(PoseArray, 'camera/human_arm_pose', 10)
+        self.tag_pose_pub = self.create_publisher(PoseStamped, 'camera/tag_pose', 10)
+
+        # --- Service for plane detection ---
+        self.get_plane_at_pixel_srv = self.create_service(
+            GetPlaneAtPixel,
+            'camera/GetPlaneAtPixel',
+            self.get_plane_at_pixel_callback
+        )
+
+        self.get_point_cloud_srv = self.create_service(
+            GetPointCloud,
+            'camera/GetPointCloud',
+            self.get_point_cloud_callback
+        )
+
+        # --- ZED Config ---
+        self.zed = sl.Camera()
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = sl.RESOLUTION.HD720
+        init_params.camera_fps = self.camera_fps
+        init_params.depth_mode = sl.DEPTH_MODE.NEURAL
+        init_params.coordinate_units = sl.UNIT.METER
+        init_params.coordinate_system = sl.COORDINATE_SYSTEM.RIGHT_HANDED_Z_UP_X_FWD #uses ros2 standard of right hand rule +Y: Left
+
+        self.get_logger().info("Initializing ZED 2i camera driver...")
+        if self.zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+            self.get_logger().error("CRITICAL: Failed to open ZED camera hardware interface!")
+            sys.exit(1)
+
+        # Enable positional tracking (required for ZED plane detection and spatial features)
+        self.zed.enable_positional_tracking(sl.PositionalTrackingParameters())
+
+        # Extract Intrinsics
+        cam_info = self.zed.get_camera_information()
+        cam_params = cam_info.camera_configuration.calibration_parameters.left_cam
+        self.fx, self.fy = cam_params.fx, cam_params.fy
+        self.cx, self.cy = cam_params.cx, cam_params.cy
+
+        # Camera Intrinsic Matrix K
+        self.K = np.array([
+            [self.fx, 0.0, self.cx],
+            [0.0, self.fy, self.cy],
+            [0.0, 0.0, 1.0],
+        ], dtype=np.float64)
+
+        self.dist = np.zeros((5, 1), dtype=np.float64)
+
+        # --- ArUco Board Config ---
+        self.aruco = cv.aruco
+        self.dictionary = self.aruco.getPredefinedDictionary(self.aruco.DICT_5X5_50)
+        self.detector_params = self.aruco.DetectorParameters()
+        self.detector = self.aruco.ArucoDetector(self.dictionary, self.detector_params)
+        self.detector_params.cornerRefinementMethod = self.aruco.CORNER_REFINE_SUBPIX
+
+        # Printed target specifications (ChArUco Board):
+        # 3x3 squares, measured board size = 92 mm, marker size = 80% of square size
+        squares_x = 3
+        squares_y = 3
+        board_size = 0.096
+        square_length = board_size / squares_x
+        marker_length = square_length * 0.8
+
+        self.board = self.aruco.CharucoBoard(
+            (squares_x, squares_y),
+            square_length,
+            marker_length,
+            self.dictionary,
+        )
+
+        # Body Tracking Setup
+        self.body_runtime = setup_body_tracking(self.zed)
+        self.image_mat = sl.Mat()
+        self.bodies = sl.Bodies()
+        self.runtime = sl.RuntimeParameters()
+
+        # Timer to grab frames at matching camera framerate could be changed if you dont wanna process every frame.
+        timer_period = 1.0 / self.camera_fps
+        self.timer = self.create_timer(timer_period, self.process_frame)
+
+        self.get_logger().info("ZED Driver Node initialized successfully.")
+
+    def process_frame(self):
+        # Grab frame from ZED SDK
+        if self.zed.grab(self.runtime) != sl.ERROR_CODE.SUCCESS:
+            return
+
+        # Retrieve image frame
+        self.zed.retrieve_image(self.image_mat, sl.VIEW.LEFT)
+        frame = self.image_mat.get_data()
+
+        # Convert BGRA to BGR
+        if frame.shape[2] == 4:
+            frame = cv.cvtColor(frame, cv.COLOR_BGRA2BGR)
+
+        # --------------------------------------------
+        # TRACKING
+        # --------------------------------------------
+        if self.tracking.get("tag", True):
+            gray = cv.cvtColor(frame, cv.COLOR_BGR2GRAY)
+            marker_corners, marker_ids, rejected = self.detector.detectMarkers(gray)
+
+            if marker_ids is not None and len(marker_ids) > 0:
+                # Draw detected marker boundaries and IDs
+                self.aruco.drawDetectedMarkers(frame, marker_corners, marker_ids)
+
+                # Estimate board pose relative to camera
+                success, rvec, tvec = self.estimate_board_pose_from_aruco_markers(
+                    self.board,
+                    marker_corners,
+                    marker_ids,
+                    self.K,
+                    self.dist,
+                )
+
+                if success:
+                    # Draw coordinate axes at board origin (length: 8 cm)
+                    cv.drawFrameAxes(frame, self.K, self.dist, rvec, tvec, 0.08)
+
+                    # Convert rotation vector to 3x3 matrix
+                    R_mat, _ = cv.Rodrigues(rvec)
+
+                    # T_C_opt_Tag: target pose in OpenCV camera optical frame
+                    T_C_opt_Tag = np.eye(4)
+                    T_C_opt_Tag[:3, :3] = R_mat
+                    T_C_opt_Tag[:3, 3] = tvec.flatten()
+
+                    # Transform from optical frame to ZED right-handed Z-UP mapped frame (X=Forward, Y=Left, Z=Up)
+                    T_zed_opt = np.array([
+                        [ 0.0,  0.0,  1.0,  0.0],
+                        [-1.0,  0.0,  0.0,  0.0],
+                        [ 0.0, -1.0,  0.0,  0.0],
+                        [ 0.0,  0.0,  0.0,  1.0]
+                    ])
+
+                    # T_C_zed_Tag: target pose in ZED camera frame (Z-UP)
+                    T_C_zed_Tag = T_zed_opt @ T_C_opt_Tag
+
+                    tvec_zed = T_C_zed_Tag[:3, 3]
+                    R_zed = T_C_zed_Tag[:3, :3]
+                    quat_zed = ScipyRot.from_matrix(R_zed).as_quat()
+
+                    distance = float(np.linalg.norm(tvec_zed))
+
+                    # Publish pose relative to ZED camera frame (RIGHT_HANDED_Z_UP)
+                    pose_msg = PoseStamped()
+                    pose_msg.header.stamp = self.get_clock().now().to_msg()
+                    pose_msg.header.frame_id = "zed_camera_frame"
+
+                    pose_msg.pose.position.x = float(tvec_zed[0])
+                    pose_msg.pose.position.y = float(tvec_zed[1])
+                    pose_msg.pose.position.z = float(tvec_zed[2])
+
+                    pose_msg.pose.orientation.x = float(quat_zed[0])
+                    pose_msg.pose.orientation.y = float(quat_zed[1])
+                    pose_msg.pose.orientation.z = float(quat_zed[2])
+                    pose_msg.pose.orientation.w = float(quat_zed[3])
+
+                    self.tag_pose_pub.publish(pose_msg)
+
+        if self.tracking.get("arm", True):
+            # Retrieve body skeleton positions
+            self.zed.retrieve_bodies(self.bodies, self.body_runtime)
+            body = get_single_body(self.bodies, mode="closest")
+
+            if body is not None:
+                latest_arm_data = get_arm_points(body, arm=self.arm_to_track)
+                if latest_arm_data is not None:
+                    # Optionally draw skeletal lines on the frame
+                    frame = draw_arm_points_and_lines(frame, latest_arm_data)
+
+                    # Extract joint coordinate vectors
+                    sh_xyz = latest_arm_data["shoulder_3d"]
+                    el_xyz = latest_arm_data["elbow_3d"]
+                    wr_xyz = latest_arm_data["wrist_3d"]
+                    hd_xyz = latest_arm_data["hand_3d"]
+
+                    # Publish skeletal tracking joint array
+                    pose_msg = PoseArray()
+                    pose_msg.header.stamp = self.get_clock().now().to_msg()
+                    pose_msg.header.frame_id = "zed_camera_frame"
+                    for joint in [sh_xyz, el_xyz, wr_xyz, hd_xyz]:
+                        p = Pose()
+                        p.position.x = float(joint[0])  # SDK X (Forward) -> ROS X
+                        p.position.y = float(joint[1])  # SDK Y (Left) -> ROS Y
+                        p.position.z = float(joint[2])  # SDK Z (Up) -> ROS Z
+                        pose_msg.poses.append(p)
+                    self.arm_pose_pub.publish(pose_msg)
+
+        if self.publish_raw:
+            # Publish raw/annotated image over ROS 2 topic
+            self.publish_image(frame)
+
+        # Local debug visualizer (optional)
+        if self.show_visualization:
+            cv.imshow("ZED Driver Debug Feed", frame)
+            cv.waitKey(1)
+
+    def estimate_board_pose_from_aruco_markers(self, board, marker_corners, marker_ids, K, dist):
+        """ Matches detected marker IDs to board object points and runs solvePnP """
+        if marker_ids is None or len(marker_ids) < 2:
+            return False, None, None
+
+        board_ids = board.getIds().flatten()
+        board_obj_points = board.getObjPoints()
+
+        obj_points = []
+        img_points = []
+
+        for detected_idx, detected_id in enumerate(marker_ids.flatten()):
+            detected_id = int(detected_id)
+            matches = np.where(board_ids == detected_id)[0]
+            if len(matches) == 0:
+                continue
+
+            board_idx = int(matches[0])
+
+            # 3D corners in board frame
+            obj_corners = np.asarray(board_obj_points[board_idx], dtype=np.float32).reshape(4, 3)
+            # 2D corners in image frame
+            img_corners = np.asarray(marker_corners[detected_idx], dtype=np.float32).reshape(4, 2)
+
+            obj_points.append(obj_corners)
+            img_points.append(img_corners)
+
+        if len(obj_points) < 2:
+            return False, None, None
+
+        obj_points = np.vstack(obj_points).astype(np.float32)
+        img_points = np.vstack(img_points).astype(np.float32)
+
+        success, rvec, tvec = cv.solvePnP(
+            obj_points,
+            img_points,
+            K,
+            dist,
+            flags=cv.SOLVEPNP_ITERATIVE,
+        )
+
+        return success, rvec, tvec
+
+    def get_point_cloud_callback(self, request, response):
+        """Retrieves the latest point cloud from the most recently grabbed ZED frame. """
+        point_cloud = sl.Mat()
+        err = self.zed.retrieve_measure(point_cloud, sl.MEASURE.XYZRGBA)
+
+        response.success = False
+
+        if err == sl.ERROR_CODE.SUCCESS:
+            point_cloud_nparray = point_cloud.get_data()
+
+            if point_cloud_nparray is not None and point_cloud_nparray.size > 0:
+                pc_msg = PointCloud2()
+                pc_msg.header.stamp = self.get_clock().now().to_msg()
+                pc_msg.header.frame_id = "zed_camera_frame"
+                pc_msg.height = point_cloud_nparray.shape[0]
+                pc_msg.width = point_cloud_nparray.shape[1]
+                pc_msg.is_dense = False
+                pc_msg.is_bigendian = False
+                pc_msg.fields = [
+                    PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+                    PointField(name='bgra', offset=12, datatype=PointField.UINT32, count=1),
+                ]
+                pc_msg.point_step = 16
+                pc_msg.row_step = pc_msg.point_step * pc_msg.width
+                pc_msg.data = point_cloud_nparray.tobytes()
+
+                response.point_cloud = pc_msg
+                response.success = True
+                self.get_logger().info("Successfully retrieved point cloud")
+            else:
+                self.get_logger().warn("Retrieved point cloud was empty")
+        else:
+            self.get_logger().warn("ZED SDK failed to retrieve point cloud")
+
+        return response
+
+    def get_plane_at_pixel_callback(self, request, response):
+        """Finds the plane geometry at a given pixel using the ZED SDK's plane detection. """
+        x, y = request.x, request.y
+        self.get_logger().info(f"Received plane request at pixel ({x}, {y})")
+
+        response.success = False
+
+        plane = sl.Plane()
+        err = self.zed.find_plane_at_hit((x, y), plane)
+
+        if err == sl.ERROR_CODE.SUCCESS:
+            centroid = plane.get_center()
+            normal = plane.get_normal()
+            bounds = plane.get_bounds()
+
+            # Verify extraction integrity
+            if np.all(np.isfinite(centroid)) and np.all(np.isfinite(normal)):
+                response.success = True
+
+                response.centroid = Point(
+                    x=float(centroid[0]),
+                    y=float(centroid[1]),
+                    z=float(centroid[2])
+                )
+                response.normal = Vector3(
+                    x=float(normal[0]),
+                    y=float(normal[1]),
+                    z=float(normal[2])
+                )
+                response.boundary_points = [
+                    Point(x=float(pt[0]), y=float(pt[1]), z=float(pt[2]))
+                    for pt in bounds
+                ]
+                response.fx = float(self.fx)
+                response.fy = float(self.fy)
+                response.cx = float(self.cx)
+                response.cy = float(self.cy)
+
+                self.get_logger().info("Successfully resolved plane geometry")
+            else:
+                self.get_logger().warn("Failed plane hit check (infinite or NaN geometry)")
+        else:
+            self.get_logger().warn("ZED SDK failed plane detection hit search")
+        
+        return response
+
+    def publish_image(self, cv_image):
+        """ Manually packages numpy image arrays to standard sensor_msgs/Image """
+        try:
+            msg = Image()
+            msg.header.stamp = self.get_clock().now().to_msg()
+            msg.header.frame_id = "zed_camera_frame"
+            msg.height = cv_image.shape[0]
+            msg.width = cv_image.shape[1]
+            msg.encoding = "bgr8"
+            msg.is_bigendian = 0
+            msg.step = cv_image.shape[1] * cv_image.shape[2]
+            msg.data = cv_image.tobytes()
+            self.image_pub.publish(msg)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish image frame: {e}")
+
+    def destroy_node(self):
+        self.get_logger().info("zed_driver node destroying")
+        try:
+            self.zed.close()
+        except Exception:
+            pass
+        if self.show_visualization:
+            cv.destroyAllWindows()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = ZedDriverNode()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
+
+if __name__ == '__main__':
+    main()

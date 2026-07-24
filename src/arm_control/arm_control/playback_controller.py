@@ -1,0 +1,150 @@
+#!/usr/bin/env python3
+
+import numpy as np
+import rclpy
+import yaml
+
+from geometry_msgs.msg import Point, Pose, PoseStamped, Quaternion
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, HistoryPolicy
+
+from arm_control.utilities.handtag_to_puck import handtag_to_puck #a util that give static transform for the handtag to puck transform
+
+
+DOWN_ORIENTATION = Quaternion(x=1.0, y=0.0, z=0.0, w=0.0)
+
+class PlaybackControllerNode(Node):
+
+    def __init__(self):
+        super().__init__('playback_controller')
+
+        self.declare_parameter('calibration_yaml', 'cam2base_calibration.yaml')
+        self.declare_parameter('position_deadband_m', 0.020) #m
+        self.declare_parameter('command_rate_hz', 5.0)
+        self.declare_parameter('always_use_down_orientation', True)
+
+        self.calibration_yaml = self.get_parameter('calibration_yaml').value
+        self.position_deadband_mm = self.get_parameter('position_deadband_m').value
+        self.command_rate_hz = self.get_parameter('command_rate_hz').value
+        self.always_use_down_orientation = self.get_parameter('always_use_down_orientation').value
+
+        self.rotation, self.translation = self.load_calibration()
+        self.latest_position_mm = None
+        self.last_commanded_position_mm = None
+
+        latest_only_qos = QoSProfile(
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
+
+        self.target_pub = self.create_publisher(
+            Pose,
+            'arm/target_cartesian_pose',
+            latest_only_qos
+        )
+
+        self.tag_sub = self.create_subscription(
+            PoseStamped,
+            'camera/tag_pose',
+            self.tag_callback,
+            latest_only_qos
+        )
+
+        self.command_timer = self.create_timer(
+            1.0 / self.command_rate_hz,
+            self.command_timer_callback
+        )
+
+        self.get_logger().info(
+            f'Playback controller started at {self.command_rate_hz:.1f} Hz '
+            f'with a {self.position_deadband_mm:.1f} mm deadband.'
+        )
+
+    def load_calibration(self):
+        with open(self.calibration_yaml, 'r') as file:
+            calibration = yaml.safe_load(file)['cam2base']
+
+        rotation = np.array(
+            calibration['rotation_matrix'],
+            dtype=np.float64
+        )
+
+        translation = np.array(
+            calibration['translation_m'],
+            dtype=np.float64
+        )
+
+        return rotation, translation
+
+    def tag_callback(self, msg):
+        """
+        Convert the newest tag pose and store it.
+
+        This callback does not publish a robot command, so incoming tag
+        messages cannot directly create a command backlog.
+        """
+        puck_pose_camera = handtag_to_puck(msg.pose)
+
+        position_camera_m = np.array([
+            puck_pose_camera.position.x,
+            puck_pose_camera.position.y,
+            puck_pose_camera.position.z
+        ])
+
+        position_base_m = (
+            self.rotation @ position_camera_m
+            + self.translation
+        )
+
+        self.latest_position_mm = position_base_m
+
+    def command_timer_callback(self):
+        """
+        Publish only the newest available target at a controlled rate.
+        """
+        if self.latest_position_mm is None:
+            return
+
+        if self.last_commanded_position_mm is not None:
+            movement_mm = np.linalg.norm(
+                self.latest_position_mm
+                - self.last_commanded_position_mm
+            )
+
+            if movement_mm < self.position_deadband_mm:
+                return
+
+        target_position_mm = self.latest_position_mm.copy()
+
+        target = Pose(
+            position=Point(
+                x=float(target_position_mm[0]),
+                y=float(target_position_mm[1]),
+                z=float(target_position_mm[2])
+            ),
+            orientation=DOWN_ORIENTATION
+        )
+
+        self.target_pub.publish(target)
+        self.last_commanded_position_mm = target_position_mm
+
+    def destroy_node(self):
+        self.command_timer.cancel()
+        super().destroy_node()
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = PlaybackControllerNode()
+
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+
+    node.destroy_node()
+    rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
