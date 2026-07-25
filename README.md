@@ -20,6 +20,16 @@ ros2 launch arm_control calibrate.launch.py
 
 these are an easy way to configure nodes and launch a bunch all at once. the launch files are in the launch folder and are pretty self explainary
 
+## Project Setup
+1. Install ROS2-Jazzy into a linux enviroment
+2. clone the repo and create a venv for the project
+3. use pip to install needed python modules
+4. source the underlying ros2 workspace
+5. source venv
+6. run  `colcon build`
+7. source new build `source install/setup.bash` (you must do this anytime you rebuild the project to see your changes
+8. run nodes or launches
+
 ## Project structure
 
 ### `arm_control` package
