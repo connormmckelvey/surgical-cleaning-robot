@@ -1,0 +1,35 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from arm_control_interfaces/srv/GetPlaneAtPixel.srv
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Point.idl"
+#include "geometry_msgs/msg/Vector3.idl"
+
+module arm_control_interfaces {
+  module srv {
+    @verbatim (language="comment", text=
+      "arm_control_interfaces/srv/GetPlaneAtPixel.srv")
+    struct GetPlaneAtPixel_Request {
+      int32 x;
+
+      int32 y;
+    };
+    struct GetPlaneAtPixel_Response {
+      boolean success;
+
+      geometry_msgs::msg::Point centroid;
+
+      geometry_msgs::msg::Vector3 normal;
+
+      sequence<geometry_msgs::msg::Point> boundary_points;
+
+      double fx;
+
+      double fy;
+
+      double cx;
+
+      double cy;
+    };
+  };
+};

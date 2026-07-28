@@ -1,0 +1,32 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from arm_control_interfaces/srv/GetSurfaceInfo.srv
+// generated code does not contain a copyright notice
+
+#include "geometry_msgs/msg/Point.idl"
+#include "geometry_msgs/msg/Vector3.idl"
+#include "sensor_msgs/msg/PointCloud2.idl"
+
+module arm_control_interfaces {
+  module srv {
+    @verbatim (language="comment", text=
+      "srv/GetSurfaceInfo.srv")
+    struct GetSurfaceInfo_Request {
+      int32 x;
+
+      int32 y;
+    };
+    struct GetSurfaceInfo_Response {
+      geometry_msgs::msg::Point surface_centroid;
+
+      geometry_msgs::msg::Vector3 surface_normal;
+
+      geometry_msgs::msg::Point spill_centroid;
+
+      geometry_msgs::msg::Vector3 spill_normal;
+
+      sensor_msgs::msg::PointCloud2 point_cloud;
+
+      boolean success;
+    };
+  };
+};

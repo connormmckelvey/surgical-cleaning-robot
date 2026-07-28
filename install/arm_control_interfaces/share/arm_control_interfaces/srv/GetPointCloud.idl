@@ -1,0 +1,18 @@
+// generated from rosidl_adapter/resource/srv.idl.em
+// with input from arm_control_interfaces/srv/GetPointCloud.srv
+// generated code does not contain a copyright notice
+
+#include "sensor_msgs/msg/PointCloud2.idl"
+
+module arm_control_interfaces {
+  module srv {
+    struct GetPointCloud_Request {
+      uint8 structure_needs_at_least_one_member;
+    };
+    struct GetPointCloud_Response {
+      boolean success;
+
+      sensor_msgs::msg::PointCloud2 point_cloud;
+    };
+  };
+};

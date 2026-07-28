@@ -1,0 +1,12 @@
+# arm_control_interfaces/srv/GetPlaneAtPixel.srv
+int32 x
+int32 y
+---
+bool success
+geometry_msgs/Point centroid
+geometry_msgs/Vector3 normal
+geometry_msgs/Point[] boundary_points
+float64 fx
+float64 fy
+float64 cx
+float64 cy

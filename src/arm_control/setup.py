@@ -42,6 +42,8 @@ setup(
             'urobot_driver = arm_control.urobot_driver:main',
             'calibrate_controller = arm_control.calibrate_controller:main',
             'tag_follower = arm_control.tag_follower:main',
+            'teleop_controller = arm_control.teleop_controller:main',
+            'keyboard_controller = arm_control.keyboard_controller:main'
         ],
     },
 )
