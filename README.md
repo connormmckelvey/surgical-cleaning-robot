@@ -127,3 +127,79 @@ I tried to have all nodes have the parameters that you might tweak be ros parame
 | `calibration.launch.py` | launches the calibration_controller node, urobot_driver, and the zed_driver node              |
 | `training.launch.py`    | launches the training_controller node, the zed_driver node, and the force_sensor_driver node  |
 | `playback.launch.py`    | launches the playback_controller node, the urobot_driver node, zed driver, visualization node |
+
+```mermaid
+flowchart TB
+    %% Hardware
+    ZEDCamera[ZED Camera]
+    ForceSensor[Force Sensor]
+    Robot[URobot Lite6]
+
+    %% Drivers
+    ZedDriver[zed_driver]
+    ForceSensorDriver[force_sensor_driver]
+    URobotDriver[urobot_driver]
+
+    %% Controllers
+    CalibrationController[calibration_controller]
+    TrainingController[training_controller]
+    PlaybackController[playback_controller]
+
+    %% Processing and Storage
+    SurfaceDetection[surface_spill_detection]
+    HandTagTransform[handtag_to_puck utility]
+    CalibrationFile[(cam2base_calibration.yaml)]
+    RosbagRecorder[ros2 bag record]
+    TrainingBag[(_training_bags)]
+
+    %% Hardware to Driver Connections
+    ZEDCamera -->|ZED SDK| ZedDriver
+    ForceSensor -->|Sensor Interface| ForceSensorDriver
+
+    Robot -->|Current State<br>xArm Python SDK| URobotDriver
+    URobotDriver -->|Robot Commands<br>xArm Python SDK| Robot
+
+    %% Calibration Workflow
+    ZedDriver -->|/camera/image_raw<br>sensor_msgs/Image| CalibrationController
+    ZedDriver -->|/camera/tag_pose<br>geometry_msgs/PoseStamped| CalibrationController
+
+    URobotDriver -->|/arm/current_cartesian_pose<br>geometry_msgs/Pose| CalibrationController
+    CalibrationController -->|/arm/target_cartesian_pose<br>geometry_msgs/Pose| URobotDriver
+
+    CalibrationController -->|Writes calibration| CalibrationFile
+
+    %% Training Workflow
+    ZedDriver -->|/camera/image_raw<br>sensor_msgs/Image| TrainingController
+
+    TrainingController -->|GetSurfaceInfo request| SurfaceDetection
+    SurfaceDetection -->|Surface and spill response| TrainingController
+
+    TrainingController -->|/training/surface_spill_info| RosbagRecorder
+    ZedDriver -->|/camera/tag_pose| RosbagRecorder
+    ForceSensorDriver -->|/force_sensor/data| RosbagRecorder
+
+    TrainingController -->|Starts and stops recording| RosbagRecorder
+    RosbagRecorder -->|Writes data| TrainingBag
+
+    %% Playback Workflow
+    ZedDriver -->|/camera/tag_pose<br>geometry_msgs/PoseStamped| PlaybackController
+    CalibrationFile -->|Camera-to-base transform| PlaybackController
+    HandTagTransform -->|Static hand-tag-to-puck transform| PlaybackController
+
+    PlaybackController -->|/arm/target_cartesian_pose<br>geometry_msgs/Pose| URobotDriver
+
+    %% Colors
+    classDef hardware fill:#fee2e2,stroke:#dc2626,stroke-width:2px,color:#000;
+    classDef driver fill:#dbeafe,stroke:#2563eb,stroke-width:2px,color:#000;
+    classDef controller fill:#dcfce7,stroke:#16a34a,stroke-width:2px,color:#000;
+    classDef processing fill:#f3e8ff,stroke:#9333ea,stroke-width:2px,color:#000;
+    classDef file fill:#fef3c7,stroke:#d97706,stroke-width:2px,color:#000;
+    classDef external fill:#f1f5f9,stroke:#475569,stroke-width:2px,color:#000;
+
+    class ZEDCamera,ForceSensor,Robot hardware;
+    class ZedDriver,ForceSensorDriver,URobotDriver driver;
+    class CalibrationController,TrainingController,PlaybackController controller;
+    class SurfaceDetection,HandTagTransform processing;
+    class CalibrationFile,TrainingBag file;
+    class RosbagRecorder external;
+```
